@@ -24,17 +24,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The harness is pinned to one agynio/e2e commit, and the platform stays
+      # at the charts the VM image ships: moving it to the newest published
+      # charts fails in their MinIO post-upgrade hook, whose image no longer
+      # pulls, before any service from this repository is deployed.
       - name: Provision cluster
-        uses: agynio/e2e/.github/actions/provision-vm@main
+        uses: agynio/e2e/.github/actions/provision-vm@435b549a937129b6858e7314648eb690894209fe # main 2026-09-17
+        with:
+          upgrade: "false"
 
       - name: Setup DevSpace
-        uses: agynio/e2e/.github/actions/setup-devspace@main
+        uses: agynio/e2e/.github/actions/setup-devspace@435b549a937129b6858e7314648eb690894209fe # main 2026-09-17
 
       - name: Deploy agents from source
         run: devspace dev
 
       - name: Run E2E tests
-        uses: agynio/e2e/.github/actions/run-tests@main
+        uses: agynio/e2e/.github/actions/run-tests@435b549a937129b6858e7314648eb690894209fe # main 2026-09-17
         env:
           E2E_SUITES: go-core
           E2E_GO_TEST_RUN: ^TestNoDuplicateWorkloads$
