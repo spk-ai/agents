@@ -1,0 +1,206 @@
+name: Publish image
+
+# Publishes one immutable image per commit for installations to pin by digest.
+# Other refs, including pull requests, run the same build and verification
+# against a registry that exists only inside the job.
+on:
+  push:
+    branches:
+      - docs/living-contracts
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - .github/workflows/publish-image.yml
+      - .dockerignore
+      - Dockerfile
+      - buf.gen.yaml
+      - buf.yaml
+      - go.mod
+      - go.sum
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize runs for one commit so a branch and tag push cannot race its tag.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_PATH: spk-ai/agents
+  PLATFORMS: linux/amd64,linux/arm64
+  # BuildKit and QEMU execute the Dockerfile, so pin them like the base images.
+  BUILDKIT_IMAGE: docker.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+  BINFMT_IMAGE: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+
+jobs:
+  image:
+    name: Build and publish commit image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Only the integration branch and v* tags log in, push to GHCR and attest.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    services:
+      # Push target for runs that must not publish.
+      registry:
+        image: docker.io/library/registry:3.1.2@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
+        ports:
+          - 5000:5000
+    outputs:
+      image: ${{ steps.target.outputs.image }}
+      digest: ${{ steps.verify.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require digest-pinned Dockerfile images
+        run: |
+          if grep -nE '^(# syntax=|FROM )' Dockerfile | grep -vE '@sha256:[0-9a-f]{64}( |$)'; then
+            echo "::error file=Dockerfile::Pin every syntax and FROM image by digest."
+            exit 1
+          fi
+
+      - name: Select destination
+        id: target
+        env:
+          PUBLISH: ${{ github.ref == 'refs/heads/docs/living-contracts' || startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          if [ "$PUBLISH" = true ]; then
+            image="ghcr.io/$IMAGE_PATH"
+          else
+            image="localhost:5000/$IMAGE_PATH"
+          fi
+          {
+            echo "publish=$PUBLISH"
+            echo "image=$image"
+            echo "ref=$image:$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: steps.target.outputs.publish == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Look for an existing commit image
+        id: existing
+        env:
+          IMAGE_REF: ${{ steps.target.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # Rebuilds are not byte-identical, so a published commit tag never moves.
+          if manifest="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest}}' 2>"$RUNNER_TEMP/inspect.err")"; then
+            digest="$(jq -er .digest <<<"$manifest")"
+            echo "::notice title=Commit image exists::$IMAGE_REF is $digest; reporting it without a rebuild."
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          elif grep -qF "$IMAGE_REF: not found" "$RUNNER_TEMP/inspect.err"; then
+            echo "No $IMAGE_REF yet."
+          else
+            # Any other failure could hide an existing tag that a push would move.
+            echo "::error::Cannot tell whether $IMAGE_REF exists: $(head -n 1 "$RUNNER_TEMP/inspect.err")"
+            exit 1
+          fi
+
+      # The runtime stage runs addgroup/adduser for each target platform.
+      - name: Set up QEMU
+        if: steps.existing.outputs.digest == ''
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: ${{ env.BINFMT_IMAGE }}
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        if: steps.existing.outputs.digest == ''
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # The registry service needs host networking. In-image provenance
+          # must not embed the triggering event payload (PR body, pusher).
+          driver-opts: |
+            image=${{ env.BUILDKIT_IMAGE }}
+            network=host
+            provenance-add-gha=false
+
+      - name: Build and push
+        id: build
+        if: steps.existing.outputs.digest == ''
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.target.outputs.ref }}
+          # actions/attest signs the full build provenance.
+          provenance: mode=min
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          annotations: |
+            index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            index:org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Verify and report digest
+        id: verify
+        env:
+          PUBLISH: ${{ steps.target.outputs.publish }}
+          IMAGE: ${{ steps.target.outputs.image }}
+          IMAGE_REF: ${{ steps.target.outputs.ref }}
+          EXPECTED: ${{ steps.build.outputs.digest || steps.existing.outputs.digest }}
+          REBUILT: ${{ steps.build.outputs.digest != '' }}
+        run: |
+          set -euo pipefail
+          manifest="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest}}')"
+          digest="$(jq -er .digest <<<"$manifest")"
+          if [ "$digest" != "$EXPECTED" ]; then
+            echo "::error::$IMAGE_REF resolves to $digest, expected $EXPECTED."
+            exit 1
+          fi
+          platforms="$(jq -r '[.manifests[].platform | select(.os == "linux") | "linux/" + .architecture] | unique | join(",")' <<<"$manifest")"
+          for platform in ${PLATFORMS//,/ }; do
+            case ",$platforms," in
+              *",$platform,"*) ;;
+              *) echo "::error::$IMAGE_REF lacks $platform."; exit 1 ;;
+            esac
+          done
+          api="$(awk '$1 == "ref:" { print $2; exit }' buf.gen.yaml)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Image: $IMAGE@$digest"
+          {
+            if [ "$PUBLISH" = true ]; then
+              echo "## Published image"
+            else
+              echo "## Verified build (not published)"
+              echo
+              echo "This run pushed only to its job-local registry."
+            fi
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| Tag | \`$GITHUB_SHA\` |"
+            echo "| Digest | \`$digest\` |"
+            echo "| Pin | \`$IMAGE@$digest\` |"
+            echo "| Platforms | \`$platforms\` |"
+            echo "| API | \`spk-ai/api@$api\` |"
+            echo "| Built by this run | $REBUILT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        if: steps.target.outputs.publish == 'true' && steps.build.outputs.digest != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.target.outputs.image }}
+          subject-digest: ${{ steps.verify.outputs.digest }}
+          push-to-registry: true
+          # Storage records would also need artifact-metadata: write.
+          create-storage-record: false

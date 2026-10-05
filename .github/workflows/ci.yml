@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, docs/living-contracts]
   pull_request:
 
 permissions:
@@ -27,16 +27,9 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           version: 1.66.0
 
+      # The same pinned API revision the image build generates from.
       - name: Generate protobuf bindings
-        run: |
-          buf generate buf.build/agynio/api \
-            --include-imports \
-            --path agynio/api/agents/v1 \
-            --path agynio/api/authorization/v1 \
-            --path agynio/api/identity/v1 \
-            --path agynio/api/images/v1 \
-            --path agynio/api/notifications/v1 \
-            --path agynio/api/organizations/v1
+        run: buf generate --include-imports
 
       - name: Run tests
         run: go test ./...
