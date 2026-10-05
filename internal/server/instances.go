@@ -332,6 +332,32 @@ func (s *Server) ResumeInstance(ctx context.Context, req *agentsv1.ResumeInstanc
 }
 
 func (s *Server) DeleteInstance(ctx context.Context, req *agentsv1.DeleteInstanceRequest) (*agentsv1.DeleteInstanceResponse, error) {
+	return s.deleteInstance(ctx, s.store, req)
+}
+
+// instanceDeletionStore is the store behaviour deleting an instance needs.
+type instanceDeletionStore interface {
+	GetAgentInstance(ctx context.Context, id uuid.UUID) (store.AgentInstance, error)
+	DeleteAgentInstance(ctx context.Context, id uuid.UUID) (store.AgentInstance, error)
+}
+
+// deleteInstance terminates an instance for a caller who holds can_manage on
+// it, and undoes each completed step if a later one fails.
+//
+// The instance's nickname is removed first and as the instance itself, the
+// same way it was set (setAgentInstanceNickname). Identity lets an identity
+// remove its own nickname with plain organization membership, and anyone
+// else's only with can_add_member or can_manage_members. Removing it as the
+// caller refused every owner who is an ordinary member, after the instance's
+// tuples had already been removed and had to be restored. Removing it as the
+// instance grants the caller nothing new: can_manage on the instance is still
+// required, and the instance can name only itself. The instance is a member
+// only through the tuple removeAgentInstanceAuthorization deletes, so the
+// nickname has to go before the tuples do.
+//
+// The store is taken as an interface so the sequence and its rollbacks can be
+// tested without a database.
+func (s *Server) deleteInstance(ctx context.Context, instances instanceDeletionStore, req *agentsv1.DeleteInstanceRequest) (*agentsv1.DeleteInstanceResponse, error) {
 	id, err := parseUUID(req.GetId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "id: %v", err)
@@ -339,38 +365,64 @@ func (s *Server) DeleteInstance(ctx context.Context, req *agentsv1.DeleteInstanc
 	if err := s.requireManageInstance(ctx, id); err != nil {
 		return nil, err
 	}
-	instance, err := s.store.GetAgentInstance(ctx, id)
+	instance, err := instances.GetAgentInstance(ctx, id)
 	if err != nil {
 		return nil, toStatusError(err)
 	}
 	if instance.State == store.AgentInstanceStateTerminated {
 		return &agentsv1.DeleteInstanceResponse{Instance: toProtoAgentInstance(instance)}, nil
 	}
-	if err := s.removeAgentInstanceAuthorization(ctx, instance); err != nil {
-		return nil, status.Errorf(codes.Internal, "authorization delete failed: %v", err)
-	}
-	removedNickname := false
-	if err := s.removeAgentNickname(ctx, instance.Meta.ID, instance.OrganizationID); err != nil {
-		rollbackErr := s.addAgentInstanceAuthorization(ctx, instance)
-		if rollbackErr != nil {
-			return nil, status.Errorf(codes.Internal, "remove instance nickname: %v; rollback: %v", err, rollbackErr)
-		}
+	removedNickname, err := s.removeAgentInstanceNickname(ctx, instance)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "remove instance nickname: %v", err)
 	}
-	removedNickname = true
-	instance, err = s.store.DeleteAgentInstance(ctx, id)
-	if err != nil {
-		rollbackErr := s.addAgentInstanceAuthorization(ctx, instance)
-		if removedNickname {
-			rollbackErr = errors.Join(rollbackErr, s.setAgentInstanceNickname(ctx, instance))
+	// Restores only what this call removed: a nickname that was already gone
+	// stays gone.
+	restoreNickname := func() error {
+		if !removedNickname {
+			return nil
 		}
+		return s.setAgentInstanceNickname(ctx, instance)
+	}
+	if err := s.removeAgentInstanceAuthorization(ctx, instance); err != nil {
+		if rollbackErr := restoreNickname(); rollbackErr != nil {
+			return nil, status.Errorf(codes.Internal, "authorization delete failed: %v; rollback: %v", err, rollbackErr)
+		}
+		return nil, status.Errorf(codes.Internal, "authorization delete failed: %v", err)
+	}
+	deleted, err := instances.DeleteAgentInstance(ctx, id)
+	if err != nil {
+		// The membership tuple comes back first: the instance restores its own
+		// nickname, which needs it. The rollback reuses the instance read
+		// above; a failed delete returns no record.
+		rollbackErr := s.addAgentInstanceAuthorization(ctx, instance)
+		rollbackErr = errors.Join(rollbackErr, restoreNickname())
 		if rollbackErr != nil {
 			return nil, status.Errorf(codes.Internal, "delete instance failed: %v; rollback: %v", err, rollbackErr)
 		}
 		return nil, toStatusError(err)
 	}
-	s.publishInstanceUpdated(ctx, instance)
-	return &agentsv1.DeleteInstanceResponse{Instance: toProtoAgentInstance(instance)}, nil
+	s.publishInstanceUpdated(ctx, deleted)
+	return &agentsv1.DeleteInstanceResponse{Instance: toProtoAgentInstance(deleted)}, nil
+}
+
+// removeAgentInstanceNickname releases the instance's handle as the instance,
+// for the reason setAgentInstanceNickname names it as the instance. It reports
+// whether this call removed it: a nickname that is already gone -- a retry
+// after a failure that left it removed -- is not an error.
+func (s *Server) removeAgentInstanceNickname(ctx context.Context, instance store.AgentInstance) (bool, error) {
+	identityCtx := metadata.AppendToOutgoingContext(ctx, "x-identity-id", instance.Meta.ID.String())
+	_, err := s.identity.RemoveNickname(identityCtx, &identityv1.RemoveNicknameRequest{
+		OrganizationId: instance.OrganizationID.String(),
+		IdentityId:     instance.Meta.ID.String(),
+	})
+	if status.Code(err) == codes.NotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // requireManageInstanceUnlessInternal authorizes a lifecycle change that the
